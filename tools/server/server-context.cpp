@@ -1,4 +1,17 @@
 #include "server-context.h"
+
+// KENNY_MOE_COLD_EXTERN
+extern "C" void ggml_moe_cold_debug_snapshot(
+        uint64_t * calls,
+        uint64_t * tokens,
+        uint64_t * possible,
+        uint64_t * slots,
+        uint64_t * unique,
+        uint64_t * c1,
+        uint64_t * c2,
+        uint64_t * c3,
+        uint64_t * c4p);
+
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -214,6 +227,45 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
+    // KENNY_TOKEN_ROUTE_SLOT
+    // Transient metadata describing the current output commit.
+    uint64_t debug_commit_seq = 0;
+    std::string debug_route = "target";
+    int32_t debug_commit_index = 0;
+    int32_t debug_commit_width = 1;
+    int32_t debug_draft_generated = 0;
+    int32_t debug_draft_accepted = 0;
+
+    // KENNY_COLD_CYCLE_SLOT
+    int64_t debug_prev_commit_us = 0;
+    int64_t debug_cycle_us       = 0;
+
+    bool debug_cold_prev_valid = false;
+
+    // Previous cumulative snapshot.
+    uint64_t debug_prev_cold_calls    = 0;
+    uint64_t debug_prev_cold_tokens   = 0;
+    uint64_t debug_prev_cold_possible = 0;
+    uint64_t debug_prev_cold_slots    = 0;
+    uint64_t debug_prev_cold_unique   = 0;
+    uint64_t debug_prev_cold_c1       = 0;
+    uint64_t debug_prev_cold_c2       = 0;
+    uint64_t debug_prev_cold_c3       = 0;
+    uint64_t debug_prev_cold_c4p      = 0;
+
+    // Delta belonging to the current output commit.
+    uint64_t debug_cold_calls    = 0;
+    uint64_t debug_cold_tokens   = 0;
+    uint64_t debug_cold_possible = 0;
+    uint64_t debug_cold_slots    = 0;
+    uint64_t debug_cold_unique   = 0;
+    uint64_t debug_cold_c1       = 0;
+    uint64_t debug_cold_c2       = 0;
+    uint64_t debug_cold_c3       = 0;
+    uint64_t debug_cold_c4p      = 0;
+
+
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -334,6 +386,42 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+
+        // KENNY_TOKEN_ROUTE_SLOT reset
+        debug_commit_seq       = 0;
+        debug_route            = "target";
+        debug_commit_index     = 0;
+        debug_commit_width     = 1;
+        debug_draft_generated  = 0;
+        debug_draft_accepted   = 0;
+
+        // KENNY_COLD_CYCLE_RESET
+        debug_prev_commit_us = 0;
+        debug_cycle_us       = 0;
+
+        debug_cold_prev_valid = false;
+
+        debug_prev_cold_calls    = 0;
+        debug_prev_cold_tokens   = 0;
+        debug_prev_cold_possible = 0;
+        debug_prev_cold_slots    = 0;
+        debug_prev_cold_unique   = 0;
+        debug_prev_cold_c1       = 0;
+        debug_prev_cold_c2       = 0;
+        debug_prev_cold_c3       = 0;
+        debug_prev_cold_c4p      = 0;
+
+        debug_cold_calls    = 0;
+        debug_cold_tokens   = 0;
+        debug_cold_possible = 0;
+        debug_cold_slots    = 0;
+        debug_cold_unique   = 0;
+        debug_cold_c1       = 0;
+        debug_cold_c2       = 0;
+        debug_cold_c3       = 0;
+        debug_cold_c4p      = 0;
+
+
 
         n_prompt_tokens_cache = 0;
 
@@ -2116,6 +2204,30 @@ private:
         res->n_decoded             = slot.n_decoded;
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+
+        // KENNY_TOKEN_ROUTE_RESULT copy
+        res->debug_route           = slot.debug_route;
+        res->debug_commit_seq      = slot.debug_commit_seq;
+        res->debug_commit_index    = slot.debug_commit_index;
+        res->debug_commit_width    = slot.debug_commit_width;
+        res->debug_draft_generated = slot.debug_draft_generated;
+        res->debug_draft_accepted  = slot.debug_draft_accepted;
+        res->debug_emit_us         = ggml_time_us();
+
+        // KENNY_COLD_CYCLE_RESULT_COPY
+        res->debug_cycle_us      = slot.debug_cycle_us;
+
+        res->debug_cold_calls    = slot.debug_cold_calls;
+        res->debug_cold_tokens   = slot.debug_cold_tokens;
+        res->debug_cold_possible = slot.debug_cold_possible;
+        res->debug_cold_slots    = slot.debug_cold_slots;
+        res->debug_cold_unique   = slot.debug_cold_unique;
+
+        res->debug_cold_c1       = slot.debug_cold_c1;
+        res->debug_cold_c2       = slot.debug_cold_c2;
+        res->debug_cold_c3       = slot.debug_cold_c3;
+        res->debug_cold_c4p      = slot.debug_cold_c4p;
+
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -3658,9 +3770,31 @@ private:
             }
         }
 
+        // KENNY_SERVER_DECODE_TIMING
+        const int64_t kenny_decode_t0 = ggml_time_us();
+
         const int ret = llama_decode(ctx_tgt, batch_view);
 
+        const int64_t kenny_llama_decode_us =
+            ggml_time_us() - kenny_decode_t0;
+
+        const int64_t kenny_metrics_t0 = ggml_time_us();
+
         metrics.on_decoded(slots);
+
+        const int64_t kenny_metrics_us =
+            ggml_time_us() - kenny_metrics_t0;
+
+        if (getenv("LLAMA_KENNY_PHASE_TIMING")) {
+            fprintf(stderr,
+                    "KENNY_SERVER_DECODE n=%d off=%d "
+                    "llama_us=%lld metrics_us=%lld ret=%d\n",
+                    (int) batch_view.n_tokens,
+                    (int) off,
+                    (long long) kenny_llama_decode_us,
+                    (long long) kenny_metrics_us,
+                    (int) ret);
+        }
 
         if (ret != 0) {
             {
@@ -3851,6 +3985,102 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
+
+            // KENNY_TOKEN_ROUTE: ordinary target commit
+            slot.debug_commit_seq++;
+            slot.debug_route            = "target";
+            slot.debug_commit_index     = 0;
+            slot.debug_commit_width     = 1;
+            slot.debug_draft_generated  = 0;
+            slot.debug_draft_accepted   = 0;
+
+            // KENNY_COLD_SNAPSHOT_TARGET
+
+            {
+                const int64_t now_us = ggml_time_us();
+
+                slot.debug_cycle_us =
+                    slot.debug_prev_commit_us > 0
+                    ? now_us - slot.debug_prev_commit_us
+                    : 0;
+
+                slot.debug_prev_commit_us = now_us;
+
+                uint64_t calls    = 0;
+                uint64_t tokens   = 0;
+                uint64_t possible = 0;
+                uint64_t slots    = 0;
+                uint64_t unique   = 0;
+                uint64_t c1       = 0;
+                uint64_t c2       = 0;
+                uint64_t c3       = 0;
+                uint64_t c4p      = 0;
+
+                ggml_moe_cold_debug_snapshot(
+                    &calls,
+                    &tokens,
+                    &possible,
+                    &slots,
+                    &unique,
+                    &c1,
+                    &c2,
+                    &c3,
+                    &c4p);
+
+                if (slot.debug_cold_prev_valid) {
+                    slot.debug_cold_calls =
+                        calls - slot.debug_prev_cold_calls;
+
+                    slot.debug_cold_tokens =
+                        tokens - slot.debug_prev_cold_tokens;
+
+                    slot.debug_cold_possible =
+                        possible - slot.debug_prev_cold_possible;
+
+                    slot.debug_cold_slots =
+                        slots - slot.debug_prev_cold_slots;
+
+                    slot.debug_cold_unique =
+                        unique - slot.debug_prev_cold_unique;
+
+                    slot.debug_cold_c1 =
+                        c1 - slot.debug_prev_cold_c1;
+
+                    slot.debug_cold_c2 =
+                        c2 - slot.debug_prev_cold_c2;
+
+                    slot.debug_cold_c3 =
+                        c3 - slot.debug_prev_cold_c3;
+
+                    slot.debug_cold_c4p =
+                        c4p - slot.debug_prev_cold_c4p;
+                } else {
+                    // First streamed token is only our baseline.
+                    slot.debug_cold_calls    = 0;
+                    slot.debug_cold_tokens   = 0;
+                    slot.debug_cold_possible = 0;
+                    slot.debug_cold_slots    = 0;
+                    slot.debug_cold_unique   = 0;
+                    slot.debug_cold_c1       = 0;
+                    slot.debug_cold_c2       = 0;
+                    slot.debug_cold_c3       = 0;
+                    slot.debug_cold_c4p      = 0;
+                }
+
+                slot.debug_prev_cold_calls    = calls;
+                slot.debug_prev_cold_tokens   = tokens;
+                slot.debug_prev_cold_possible = possible;
+                slot.debug_prev_cold_slots    = slots;
+                slot.debug_prev_cold_unique   = unique;
+                slot.debug_prev_cold_c1       = c1;
+                slot.debug_prev_cold_c2       = c2;
+                slot.debug_prev_cold_c3       = c3;
+                slot.debug_prev_cold_c4p      = c4p;
+
+                slot.debug_cold_prev_valid = true;
+            }
+
+
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
@@ -3964,7 +4194,108 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+
+            // KENNY_TOKEN_ROUTE: one verified speculative commit.
+            // ids contains the tokens committed by this verification cycle.
+            slot.debug_commit_seq++;
+            slot.debug_commit_width     = (int32_t) ids.size();
+            slot.debug_draft_generated  = (int32_t) n_draft;
+            slot.debug_draft_accepted   = (int32_t) n_accepted;
+
+            // KENNY_COLD_SNAPSHOT_MTP
+
+            {
+                const int64_t now_us = ggml_time_us();
+
+                slot.debug_cycle_us =
+                    slot.debug_prev_commit_us > 0
+                    ? now_us - slot.debug_prev_commit_us
+                    : 0;
+
+                slot.debug_prev_commit_us = now_us;
+
+                uint64_t calls    = 0;
+                uint64_t tokens   = 0;
+                uint64_t possible = 0;
+                uint64_t slots    = 0;
+                uint64_t unique   = 0;
+                uint64_t c1       = 0;
+                uint64_t c2       = 0;
+                uint64_t c3       = 0;
+                uint64_t c4p      = 0;
+
+                ggml_moe_cold_debug_snapshot(
+                    &calls,
+                    &tokens,
+                    &possible,
+                    &slots,
+                    &unique,
+                    &c1,
+                    &c2,
+                    &c3,
+                    &c4p);
+
+                if (slot.debug_cold_prev_valid) {
+                    slot.debug_cold_calls =
+                        calls - slot.debug_prev_cold_calls;
+
+                    slot.debug_cold_tokens =
+                        tokens - slot.debug_prev_cold_tokens;
+
+                    slot.debug_cold_possible =
+                        possible - slot.debug_prev_cold_possible;
+
+                    slot.debug_cold_slots =
+                        slots - slot.debug_prev_cold_slots;
+
+                    slot.debug_cold_unique =
+                        unique - slot.debug_prev_cold_unique;
+
+                    slot.debug_cold_c1 =
+                        c1 - slot.debug_prev_cold_c1;
+
+                    slot.debug_cold_c2 =
+                        c2 - slot.debug_prev_cold_c2;
+
+                    slot.debug_cold_c3 =
+                        c3 - slot.debug_prev_cold_c3;
+
+                    slot.debug_cold_c4p =
+                        c4p - slot.debug_prev_cold_c4p;
+                } else {
+                    // First streamed token is only our baseline.
+                    slot.debug_cold_calls    = 0;
+                    slot.debug_cold_tokens   = 0;
+                    slot.debug_cold_possible = 0;
+                    slot.debug_cold_slots    = 0;
+                    slot.debug_cold_unique   = 0;
+                    slot.debug_cold_c1       = 0;
+                    slot.debug_cold_c2       = 0;
+                    slot.debug_cold_c3       = 0;
+                    slot.debug_cold_c4p      = 0;
+                }
+
+                slot.debug_prev_cold_calls    = calls;
+                slot.debug_prev_cold_tokens   = tokens;
+                slot.debug_prev_cold_possible = possible;
+                slot.debug_prev_cold_slots    = slots;
+                slot.debug_prev_cold_unique   = unique;
+                slot.debug_prev_cold_c1       = c1;
+                slot.debug_prev_cold_c2       = c2;
+                slot.debug_prev_cold_c3       = c3;
+                slot.debug_prev_cold_c4p      = c4p;
+
+                slot.debug_cold_prev_valid = true;
+            }
+
+
             for (size_t i = 0; i < ids.size(); ++i) {
+
+                // KENNY_TOKEN_ROUTE: provenance for this token inside the commit.
+                slot.debug_commit_index = (int32_t) i;
+                slot.debug_route =
+                    (i + 1 < ids.size()) ? "mtp_accept" : "mtp_target";
+
                 completion_token_output result;
 
                 result.tok          = ids[i];

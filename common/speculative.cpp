@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cstdlib>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1279,6 +1280,47 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // MTP_ACCEPT_ONLY_CATCHUP_V1
+    //
+    // During generation, process() stashes the verification batch instead of
+    // immediately decoding every speculative row into the MTP context.
+    //
+    // Once accept() tells us which target rows actually survived, only the
+    // committed prefix is decoded into ctx_dft. Rejected speculative rows
+    // never touch the MTP head.
+    //
+    // This fast path is deliberately restricted to the Qwen-style:
+    //   - n_seq == 1
+    //   - non-shared memory
+    //   - one reusable MTP head
+    bool mtp_accept_catchup = false;
+    bool mtp_generation_started = false;
+    bool mtp_deferred_ready = false;
+
+    int32_t mtp_deferred_n_tokens = 0;
+
+    std::vector<llama_token> mtp_deferred_tokens;
+    std::vector<llama_pos>   mtp_deferred_pos;
+    std::vector<float>       mtp_deferred_embd;
+
+    uint64_t mtp_commit_calls = 0;
+    uint64_t mtp_verify_rows  = 0;
+    uint64_t mtp_commit_rows  = 0;
+
+    // Optional one-way profitability kill switch.
+    //
+    // After every 64 speculative cycles, if actual accepted/generated
+    // draft-token ratio is below LLAMA_MTP_KILL_ACCEPT, MTP is disabled for
+    // the remainder of the request. It is deliberately one-way so we can
+    // completely stop maintaining the MTP context once it loses.
+    double   mtp_kill_accept = 0.0;
+    bool     mtp_killed      = false;
+    uint64_t mtp_probe_calls = 0;
+    uint64_t mtp_probe_gen   = 0;
+    uint64_t mtp_probe_acc   = 0;
+
+    static constexpr uint64_t MTP_KILL_WINDOW = 64;
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1342,6 +1384,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        const bool mtp_fast_supported =
+            n_seq == 1 && !is_mem_shared && !chain_heads;
+
+        if (const char * env = std::getenv("LLAMA_MTP_ACCEPT_ONLY_CATCHUP")) {
+            if (std::strcmp(env, "0") != 0 && mtp_fast_supported) {
+                mtp_accept_catchup = true;
+            } else if (std::strcmp(env, "0") != 0) {
+                SPC_WRN(
+                    "%s",
+                    "MTP_ACCEPT_CATCHUP requested but unsupported for this "
+                    "MTP mode; leaving stock behavior enabled\n");
+            }
+        }
+
+        if (const char * env = std::getenv("LLAMA_MTP_KILL_ACCEPT")) {
+            char * endp = nullptr;
+            const double v = std::strtod(env, &endp);
+
+            if (endp != env && *endp == '\0' &&
+                    v > 0.0 && v <= 1.0 && mtp_fast_supported) {
+                mtp_kill_accept = v;
+            } else {
+                SPC_WRN(
+                    "LLAMA_MTP_KILL_ACCEPT='%s' ignored; expected a value "
+                    "in (0,1] on single-sequence Qwen MTP\n",
+                    env);
+            }
+        }
+
+        if (mtp_accept_catchup || mtp_kill_accept > 0.0) {
+            SPC_INF(
+                "MTP_FASTPATH armed: accept_only_catchup=%d "
+                "kill_accept=%.3f kill_window=%" PRIu64 "\n",
+                (int) mtp_accept_catchup,
+                mtp_kill_accept,
+                MTP_KILL_WINDOW);
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -1387,6 +1467,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        if (mtp_accept_catchup || mtp_kill_accept > 0.0) {
+            mtp_generation_started = true;
+            mtp_deferred_ready     = false;
+            mtp_deferred_n_tokens  = 0;
+
+            mtp_killed     = false;
+            mtp_probe_calls = 0;
+            mtp_probe_gen   = 0;
+            mtp_probe_acc   = 0;
+
+            SPC_INF(
+                "MTP_FASTPATH request begin: catchup=%d kill_accept=%.3f\n",
+                (int) mtp_accept_catchup,
+                mtp_kill_accept);
+        }
+
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
@@ -1406,6 +1502,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        // A fresh prompt is processed before begin(). If the previous request
+        // killed MTP, re-arm normal prompt catch-up as soon as position 0
+        // arrives so the new request starts with a valid MTP context.
+        if ((mtp_accept_catchup || mtp_kill_accept > 0.0) &&
+                batch_in.pos != nullptr &&
+                batch_in.pos[0] == 0) {
+            mtp_generation_started = false;
+            mtp_deferred_ready     = false;
+            mtp_deferred_n_tokens  = 0;
+
+            mtp_killed      = false;
+            mtp_probe_calls = 0;
+            mtp_probe_gen   = 0;
+            mtp_probe_acc   = 0;
+        }
+
+        // One-way kill: no drafting means this context will not be used again
+        // until the next request. Do not spend another microsecond syncing it.
+        if (mtp_generation_started && mtp_killed) {
             return true;
         }
 
@@ -1433,8 +1551,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        if (mtp_accept_catchup && mtp_generation_started) {
+            if (batch_in.pos == nullptr) {
+                SPC_ERR("%s", "MTP_ACCEPT_CATCHUP requires explicit positions\n");
+                return false;
+            }
+
+            mtp_deferred_n_tokens = n_tokens;
+            mtp_deferred_tokens.resize((size_t) n_tokens);
+            mtp_deferred_pos.resize((size_t) n_tokens);
+            mtp_deferred_embd.resize((size_t) n_tokens * n_embd);
+
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                mtp_deferred_tokens[k] = batch_in.token[k];
+                mtp_deferred_pos[k]    = batch_in.pos[k];
+            }
+
+            // First MTP row consumes the carry from the previous committed
+            // target position.
+            std::memcpy(
+                mtp_deferred_embd.data(),
+                pending_h[0].data(),
+                row_bytes);
+
+            // Remaining rows consume the previous target hidden row.
+            for (int32_t k = 1; k < n_tokens; ++k) {
+                const float * h =
+                    llama_get_embeddings_nextn_ith(ctx_tgt, k - 1);
+
+                if (h == nullptr) {
+                    SPC_ERR(
+                        "MTP_ACCEPT_CATCHUP: target hidden row %d missing\n",
+                        k - 1);
+                    return false;
+                }
+
+                std::memcpy(
+                    mtp_deferred_embd.data() + (size_t) k * n_embd,
+                    h,
+                    row_bytes);
+            }
+
+            mtp_deferred_ready = true;
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared &&
+                !(mtp_accept_catchup && mtp_generation_started)) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -1518,6 +1681,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (mtp_generation_started && mtp_killed) {
+            return;
+        }
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1678,9 +1844,159 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        // Commit only target rows that actually survived verification.
+        if (mtp_accept_catchup &&
+                mtp_generation_started &&
+                !mtp_killed &&
+                mtp_deferred_ready) {
+
+            const int32_t n_keep = std::min<int32_t>(
+                (int32_t) n_accepted + 1,
+                mtp_deferred_n_tokens);
+
+            if (n_keep > 0) {
+                auto * ctx_dft = params.ctx_dft;
+                auto * mem_dft = llama_get_memory(ctx_dft);
+
+                // Defensive cleanup of any speculative suffix. Normally the
+                // server has already restored ctx_dft to the pre-draft state.
+                llama_memory_seq_rm(
+                    mem_dft,
+                    seq_id,
+                    mtp_deferred_pos[0],
+                    -1);
+
+                common_batch_clear(batch);
+
+                const size_t row_bytes =
+                    (size_t) n_embd * sizeof(float);
+
+                for (int32_t k = 0; k < n_keep; ++k) {
+                    common_batch_add(
+                        batch,
+                        mtp_deferred_tokens[k],
+                        mtp_deferred_pos[k],
+                        { seq_id },
+                        false);
+
+                    std::memcpy(
+                        batch.embd +
+                            (size_t) (batch.n_tokens - 1) * n_embd,
+                        mtp_deferred_embd.data() +
+                            (size_t) k * n_embd,
+                        row_bytes);
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR(
+                        "MTP_ACCEPT_CATCHUP llama_decode failed rc=%d "
+                        "keep=%d verified=%d\n",
+                        rc,
+                        n_keep,
+                        mtp_deferred_n_tokens);
+
+                    mtp_deferred_ready = false;
+                    return;
+                }
+
+                mtp_commit_calls++;
+                mtp_verify_rows +=
+                    (uint64_t) mtp_deferred_n_tokens;
+                mtp_commit_rows +=
+                    (uint64_t) n_keep;
+
+                if ((mtp_commit_calls % 256) == 0) {
+                    const uint64_t dropped =
+                        mtp_verify_rows - mtp_commit_rows;
+
+                    SPC_INF(
+                        "MTP_ACCEPT_CATCHUP stats: calls=%" PRIu64
+                        " verified_rows=%" PRIu64
+                        " committed_rows=%" PRIu64
+                        " dropped_rows=%" PRIu64
+                        " drop_frac=%.3f\n",
+                        mtp_commit_calls,
+                        mtp_verify_rows,
+                        mtp_commit_rows,
+                        dropped,
+                        mtp_verify_rows
+                            ? (double) dropped /
+                              (double) mtp_verify_rows
+                            : 0.0);
+                }
+            }
+
+            mtp_deferred_ready    = false;
+            mtp_deferred_n_tokens = 0;
+        }
+
+        const int32_t i_h =
+            std::min<int32_t>(n_accepted, n_rows - 1);
+
+        const size_t row_bytes =
+            (size_t) n_embd * sizeof(float);
+
+        std::memcpy(
+            pending_h[seq_id].data(),
+            verify_h[seq_id].data() +
+                (size_t) i_h * n_embd,
+            row_bytes);
+
+        // Realized-acceptance profitability gate.
+        //
+        // Unlike MTP probability or hot-cache occupancy, this is ground truth:
+        // how many speculative tokens the target actually accepted.
+        if (mtp_generation_started &&
+                !mtp_killed &&
+                mtp_kill_accept > 0.0) {
+
+            const uint64_t generated =
+                n_rows > 1 ? (uint64_t) (n_rows - 1) : 0;
+
+            if (generated > 0) {
+                mtp_probe_calls++;
+                mtp_probe_gen += generated;
+                mtp_probe_acc +=
+                    std::min<uint64_t>(n_accepted, generated);
+
+                if (mtp_probe_calls >= MTP_KILL_WINDOW) {
+                    const double rate =
+                        mtp_probe_gen
+                            ? (double) mtp_probe_acc /
+                              (double) mtp_probe_gen
+                            : 0.0;
+
+                    if (rate < mtp_kill_accept) {
+                        mtp_killed = true;
+
+                        SPC_INF(
+                            "MTP_KILL: acceptance %.3f < %.3f over "
+                            "%" PRIu64 " cycles (%" PRIu64 "/%" PRIu64
+                            " tokens); MTP OFF for rest of request\n",
+                            rate,
+                            mtp_kill_accept,
+                            mtp_probe_calls,
+                            mtp_probe_acc,
+                            mtp_probe_gen);
+                    } else {
+                        SPC_INF(
+                            "MTP_KEEP: acceptance %.3f >= %.3f over "
+                            "%" PRIu64 " cycles (%" PRIu64 "/%" PRIu64
+                            " tokens)\n",
+                            rate,
+                            mtp_kill_accept,
+                            mtp_probe_calls,
+                            mtp_probe_acc,
+                            mtp_probe_gen);
+                    }
+
+                    mtp_probe_calls = 0;
+                    mtp_probe_gen   = 0;
+                    mtp_probe_acc   = 0;
+                }
+            }
+        }
     }
 
     bool need_embd() const override {
@@ -2321,6 +2637,11 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+        // MTP is a secondary NextN context sharing the target model.
+        // The expert hotstore belongs to the target context; allocating it
+        // here would duplicate the entire GPU expert cache.
+        cparams.expert_hot_s = 0;
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

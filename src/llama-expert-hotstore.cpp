@@ -602,6 +602,8 @@ static size_t staging_slot_off(const std::vector<llama_expert_hotstore::entry *>
 }
 
 bool llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
+    const int64_t kenny_resync_t0 = ggml_time_us();
+
     if (!is_filled || hot_s <= 0 || buf_dev.empty()) {
         return false;
     }
@@ -996,6 +998,16 @@ bool llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
             fprintf(stderr, "hotstore: re-sync changed %d slots\n", changed);
         }
     }
+    const int64_t kenny_resync_us = ggml_time_us() - kenny_resync_t0;
+
+    if (getenv("LLAMA_KENNY_PHASE_TIMING")) {
+        fprintf(stderr,
+                    "KENNY_RESYNC tok=%lld elapsed_us=%lld changed=%d\\n",
+                    (long long) heatmap.tokens_total,
+                    (long long) kenny_resync_us,
+                    changed);
+    }
+
     return changed > 0;
 }
 

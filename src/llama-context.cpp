@@ -1448,7 +1448,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         expert_hotstore->reset_counts(); // zero the cold-op tallies for this token
     }
 
+    const int64_t kenny_graph_t0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const int64_t kenny_graph_us = ggml_time_us() - kenny_graph_t0;
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1457,13 +1460,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // cold-op counts feed the heatmap directly (no D2H readback, no sync).
     // decode only: prefill routing is uniform and would dilute the ranking.
-    if (expert_heatmap && expert_hotstore && expert_hotstore->is_filled && ubatch.n_tokens == 1) {
+    int64_t kenny_read_us   = 0;
+    int64_t kenny_resync_us = 0;
+    bool    kenny_resync_changed = false;
+
+    if (expert_heatmap && expert_hotstore && expert_hotstore->is_filled && ubatch.n_tokens <= 3) {
+        const int64_t t0 = ggml_time_us();
         expert_hotstore->read_counts(*expert_heatmap, ubatch.n_tokens);
+        kenny_read_us = ggml_time_us() - t0;
     }
+
     if (expert_heatmap && expert_hotstore && expert_hotstore->is_filled) {
-        expert_hotstore->maybe_resync(*expert_heatmap, ubatch.n_tokens > 1);
-        if (ubatch.n_tokens == 1 && getenv("LLAMA_EXPERT_HITRATE")) {
+        const int64_t t0 = ggml_time_us();
+        kenny_resync_changed =
+            expert_hotstore->maybe_resync(*expert_heatmap, ubatch.n_tokens > 3);
+        kenny_resync_us = ggml_time_us() - t0;
+
+        if (ubatch.n_tokens <= 3 && getenv("LLAMA_EXPERT_HITRATE")) {
             expert_hotstore->log_hit_rate(res->moe_sel_experts);
+        }
+
+        if (getenv("LLAMA_KENNY_PHASE_TIMING")) {
+            fprintf(stderr,
+                "KENNY_DECODE n=%d tok=%lld graph_us=%lld read_us=%lld resync_us=%lld changed=%d\n",
+                (int) ubatch.n_tokens,
+                (long long) expert_heatmap->tokens_total,
+                (long long) kenny_graph_us,
+                (long long) kenny_read_us,
+                (long long) kenny_resync_us,
+                kenny_resync_changed ? 1 : 0);
         }
     }
 
@@ -1977,7 +2002,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const int64_t kenny_ubatch_t0 = ggml_time_us();
+
+        const auto * res =
+            process_ubatch(
+                ubatch,
+                ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(),
+                status);
+
+        const int64_t kenny_ubatch_us =
+            ggml_time_us() - kenny_ubatch_t0;
+
+        // Target hotstore context only; don't spam timings from the MTP draft context.
+        if (getenv("LLAMA_KENNY_PHASE_TIMING") && expert_hotstore) {
+            fprintf(stderr,
+                    "KENNY_UBATCH n=%d total_us=%lld\n",
+                    (int) ubatch.n_tokens,
+                    (long long) kenny_ubatch_us);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

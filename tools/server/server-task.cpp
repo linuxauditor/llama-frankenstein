@@ -1174,6 +1174,43 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         auto & last_json = deltas[deltas.size() - 1];
         GGML_ASSERT(last_json.at("choices").size() >= 1);
 
+        // KENNY_TOKEN_ROUTE_JSON
+        // Non-standard debug extension. OpenAI clients should ignore
+        // unknown top-level fields.
+        if (!is_progress) {
+            last_json["x_token"] = {
+                {"route",           debug_route},
+                {"commit_seq",      debug_commit_seq},
+                {"commit_index",    debug_commit_index},
+                {"commit_width",    debug_commit_width},
+                {"draft_generated", debug_draft_generated},
+                {"draft_accepted",  debug_draft_accepted},
+                {"token_id",        tokens.empty() ? -1 : (int32_t) tokens[0]},
+                {"n_decoded",       n_decoded},
+                {"emit_us",         debug_emit_us},
+
+                // KENNY_COLD_CYCLE_JSON
+                {"cycle_us",      debug_cycle_us},
+
+                {"cold_calls",    debug_cold_calls},
+                {"cold_tokens",   debug_cold_tokens},
+                {"cold_possible", debug_cold_possible},
+                {"cold_slots",    debug_cold_slots},
+                {"hot_slots",
+                    debug_cold_possible >= debug_cold_slots
+                        ? debug_cold_possible - debug_cold_slots
+                        : 0},
+                {"cold_unique",   debug_cold_unique},
+
+                {"cold_c1",       debug_cold_c1},
+                {"cold_c2",       debug_cold_c2},
+                {"cold_c3",       debug_cold_c3},
+                {"cold_c4p",      debug_cold_c4p},
+
+            };
+        }
+
+
         if (prob_output.probs.size() > 0) {
             last_json.at("choices").at(0)["logprobs"] = json {
                 {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},

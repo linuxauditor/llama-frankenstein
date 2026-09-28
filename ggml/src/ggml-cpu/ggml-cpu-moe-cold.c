@@ -18,6 +18,47 @@
 #include <assert.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
+
+// KENNY_MOE_COLD_GLOBAL_COUNTERS
+//
+// Process-wide cumulative counters for correlating streamed-token stalls
+// with CPU cold-expert work. Updates happen only on ggml worker ith==0.
+//
+// GCC/Clang __atomic builtins avoid needing to change compiler/C standard
+// settings and make server-side snapshots safe.
+static uint64_t g_kenny_cold_calls    = 0;
+static uint64_t g_kenny_cold_tokens   = 0;
+static uint64_t g_kenny_cold_possible = 0;
+static uint64_t g_kenny_cold_slots    = 0;
+static uint64_t g_kenny_cold_unique   = 0;
+static uint64_t g_kenny_cold_c1       = 0;
+static uint64_t g_kenny_cold_c2       = 0;
+static uint64_t g_kenny_cold_c3       = 0;
+static uint64_t g_kenny_cold_c4p      = 0;
+
+void ggml_moe_cold_debug_snapshot(
+        uint64_t * calls,
+        uint64_t * tokens,
+        uint64_t * possible,
+        uint64_t * slots,
+        uint64_t * unique,
+        uint64_t * c1,
+        uint64_t * c2,
+        uint64_t * c3,
+        uint64_t * c4p) {
+
+    *calls    = __atomic_load_n(&g_kenny_cold_calls,    __ATOMIC_RELAXED);
+    *tokens   = __atomic_load_n(&g_kenny_cold_tokens,   __ATOMIC_RELAXED);
+    *possible = __atomic_load_n(&g_kenny_cold_possible, __ATOMIC_RELAXED);
+    *slots    = __atomic_load_n(&g_kenny_cold_slots,    __ATOMIC_RELAXED);
+    *unique   = __atomic_load_n(&g_kenny_cold_unique,   __ATOMIC_RELAXED);
+    *c1       = __atomic_load_n(&g_kenny_cold_c1,       __ATOMIC_RELAXED);
+    *c2       = __atomic_load_n(&g_kenny_cold_c2,       __ATOMIC_RELAXED);
+    *c3       = __atomic_load_n(&g_kenny_cold_c3,       __ATOMIC_RELAXED);
+    *c4p      = __atomic_load_n(&g_kenny_cold_c4p,      __ATOMIC_RELAXED);
+}
+
 
 #if defined(_WIN32)
 
@@ -175,6 +216,131 @@ void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+
+    // Debug instrumentation: measure cold-expert reuse and hot-cache hit rate.
+    // matrix_row_counts[] contains only routed COLD expert slots.
+    if (ith == 0) {
+        static uint64_t dbg_calls    = 0;
+        static uint64_t dbg_tokens   = 0;
+        static uint64_t dbg_possible = 0;
+        static uint64_t dbg_slots    = 0;
+        static uint64_t dbg_unique   = 0;
+        static uint64_t dbg_c1       = 0;
+        static uint64_t dbg_c2       = 0;
+        static uint64_t dbg_c3       = 0;
+        static uint64_t dbg_c4p      = 0;
+
+        dbg_calls++;
+        dbg_tokens   += (uint64_t) n_tokens;
+        dbg_possible += (uint64_t) n_tokens * (uint64_t) n_ids;
+
+        for (int e = 0; e < n_as; e++) {
+            const int64_t n = matrix_row_counts[e];
+
+            if (n > 0) {
+                dbg_unique++;
+                dbg_slots += (uint64_t) n;
+
+                if      (n == 1) dbg_c1++;
+                else if (n == 2) dbg_c2++;
+                else if (n == 3) dbg_c3++;
+                else             dbg_c4p++;
+            }
+        }
+
+        if ((dbg_calls % 4096) == 0) {
+            const double reuse_ratio =
+                dbg_unique ? (double) dbg_slots / (double) dbg_unique : 0.0;
+
+            const double cold_frac =
+                dbg_possible ? (double) dbg_slots / (double) dbg_possible : 0.0;
+
+            fprintf(stderr,
+                "MOE_COLD_REUSE "
+                "calls=%llu tokens=%llu possible=%llu "
+                "cold_slots=%llu unique=%llu "
+                "reuse=%.4f cold_frac=%.4f hot_frac=%.4f "
+                "c1=%llu c2=%llu c3=%llu c4p=%llu\n",
+                (unsigned long long) dbg_calls,
+                (unsigned long long) dbg_tokens,
+                (unsigned long long) dbg_possible,
+                (unsigned long long) dbg_slots,
+                (unsigned long long) dbg_unique,
+                reuse_ratio,
+                cold_frac,
+                1.0 - cold_frac,
+                (unsigned long long) dbg_c1,
+                (unsigned long long) dbg_c2,
+                (unsigned long long) dbg_c3,
+                (unsigned long long) dbg_c4p);
+        }
+    }
+
+
+    // KENNY_MOE_COLD_ACCUMULATE
+    //
+    // Per-call cold routing information. matrix_row_counts[e] is the
+    // number of routed COLD rows for expert e in this invocation.
+    if (ith == 0) {
+        uint64_t call_slots  = 0;
+        uint64_t call_unique = 0;
+        uint64_t call_c1     = 0;
+        uint64_t call_c2     = 0;
+        uint64_t call_c3     = 0;
+        uint64_t call_c4p    = 0;
+
+        for (int e = 0; e < n_as; ++e) {
+            const int64_t n = matrix_row_counts[e];
+
+            if (n <= 0) {
+                continue;
+            }
+
+            call_unique++;
+            call_slots += (uint64_t) n;
+
+            if      (n == 1) call_c1++;
+            else if (n == 2) call_c2++;
+            else if (n == 3) call_c3++;
+            else             call_c4p++;
+        }
+
+        __atomic_fetch_add(&g_kenny_cold_calls,
+                           1,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_tokens,
+                           (uint64_t) n_tokens,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_possible,
+                           (uint64_t) n_tokens * (uint64_t) n_ids,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_slots,
+                           call_slots,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_unique,
+                           call_unique,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_c1,
+                           call_c1,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_c2,
+                           call_c2,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_c3,
+                           call_c3,
+                           __ATOMIC_RELAXED);
+
+        __atomic_fetch_add(&g_kenny_cold_c4p,
+                           call_c4p,
+                           __ATOMIC_RELAXED);
+    }
 
     // phase A: gate/up dots for all cold slots into gate_out/up_out
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {

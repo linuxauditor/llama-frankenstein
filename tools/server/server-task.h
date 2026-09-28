@@ -420,6 +420,32 @@ struct server_task_result_cmpl_partial : server_task_result {
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
 
+    // KENNY_TOKEN_ROUTE_RESULT
+    // Debug-only provenance for each streamed generated token.
+    std::string debug_route = "unknown";
+    uint64_t debug_commit_seq = 0;
+    int32_t debug_commit_index = 0;
+    int32_t debug_commit_width = 1;
+    int32_t debug_draft_generated = 0;
+    int32_t debug_draft_accepted = 0;
+    int64_t debug_emit_us = 0;
+
+    // KENNY_COLD_CYCLE_RESULT
+    int64_t  debug_cycle_us      = 0;
+
+    uint64_t debug_cold_calls    = 0;
+    uint64_t debug_cold_tokens   = 0;
+    uint64_t debug_cold_possible = 0;
+    uint64_t debug_cold_slots    = 0;
+    uint64_t debug_cold_unique   = 0;
+
+    uint64_t debug_cold_c1       = 0;
+    uint64_t debug_cold_c2       = 0;
+    uint64_t debug_cold_c3       = 0;
+    uint64_t debug_cold_c4p      = 0;
+
+
+
     bool post_sampling_probs;
     bool is_progress = false;
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
